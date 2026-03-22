@@ -50,6 +50,12 @@ claude --dangerously-load-development-channels server:wechat
 cargo run --bin wechat-channel
 ```
 
+如果你只想做一个微信回声机器人，收到什么回什么（优先原样回发，文件也会尝试原样回发），可以运行：
+
+```bash
+cargo run --bin wechat-echo
+```
+
 ### 4. 在微信中发消息
 
 打开微信，找到 ClawBot 对话，发送消息。消息会出现在 Claude Code 终端中，Claude 的回复会自动发回微信。
@@ -59,6 +65,7 @@ cargo run --bin wechat-channel
 | 文件 | 说明 |
 |------|------|
 | `src/bin/wechat-channel.rs` | MCP Channel 服务器主程序 |
+| `src/bin/wechat-echo.rs` | 微信回声机器人，收到什么回什么 |
 | `src/bin/setup.rs` | 独立的微信扫码登录工具 |
 | `src/lib.rs` | WeChat API、凭据、轮询与 MCP 公共逻辑 |
 | `Cargo.toml` | Rust 项目配置 |

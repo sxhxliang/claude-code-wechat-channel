@@ -4,14 +4,14 @@ use chrono::Utc;
 use rand::RngCore;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader as AsyncBufReader};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 
@@ -57,36 +57,57 @@ pub struct QrStatusResponse {
     pub ilink_user_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageItem {
     #[serde(rename = "type")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_type: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_item: Option<TextItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_item: Option<VoiceItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_msg: Option<RefMessage>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeixinMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_type: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_list: Option<Vec<MessageItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_token: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +141,43 @@ pub fn credentials_file() -> PathBuf {
 
 pub fn sync_buf_file() -> PathBuf {
     credentials_dir().join("sync_buf.txt")
+}
+
+pub fn named_sync_buf_file(name: &str) -> PathBuf {
+    credentials_dir().join(format!("sync_buf_{name}.txt"))
+}
+
+pub fn debug_dump_dir() -> PathBuf {
+    credentials_dir().join("debug")
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
+pub fn write_debug_text(label: &str, sender_id: &str, content: &str) -> Result<PathBuf> {
+    let dir = debug_dump_dir();
+    fs::create_dir_all(&dir).context("failed to create debug dump dir")?;
+    let filename = format!(
+        "{}_{}_{}.txt",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        sanitize_filename_component(label),
+        sanitize_filename_component(sender_id)
+    );
+    let path = dir.join(filename);
+    fs::write(&path, content).with_context(|| format!("failed to write debug dump {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn write_debug_json<T: Serialize>(label: &str, sender_id: &str, value: &T) -> Result<PathBuf> {
+    let serialized = serde_json::to_string_pretty(value)?;
+    write_debug_text(label, sender_id, &serialized)
 }
 
 pub fn load_credentials() -> Option<AccountData> {
@@ -369,28 +427,74 @@ pub async fn send_text_message(
     context_token: &str,
 ) -> Result<String> {
     let client_id = generate_client_id();
+    let payload = build_outbound_payload(
+        &client_id,
+        to,
+        &[MessageItem {
+            item_type: Some(MSG_ITEM_TEXT),
+            text_item: Some(TextItem {
+                text: Some(text.to_string()),
+                extra: Map::new(),
+            }),
+            voice_item: None,
+            ref_msg: None,
+            extra: Map::new(),
+        }],
+        context_token,
+    );
+    post_send_message(client, base_url, token, &payload).await?;
+    Ok(client_id)
+}
+
+pub async fn send_message_items(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    to: &str,
+    items: &[MessageItem],
+    context_token: &str,
+) -> Result<String> {
+    let client_id = generate_client_id();
+    let payload = build_outbound_payload(&client_id, to, items, context_token);
+    post_send_message(client, base_url, token, &payload).await?;
+    Ok(client_id)
+}
+
+pub fn build_outbound_payload(
+    client_id: &str,
+    to: &str,
+    items: &[MessageItem],
+    context_token: &str,
+) -> Value {
+    json!({
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to,
+            "client_id": client_id,
+            "message_type": MSG_TYPE_BOT,
+            "message_state": MSG_STATE_FINISH,
+            "item_list": items,
+            "context_token": context_token,
+        },
+        "base_info": { "channel_version": CHANNEL_VERSION }
+    })
+}
+
+pub async fn post_send_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    payload: &Value,
+) -> Result<String> {
     api_fetch(
         client,
         base_url,
         "ilink/bot/sendmessage",
-        json!({
-            "msg": {
-                "from_user_id": "",
-                "to_user_id": to,
-                "client_id": client_id,
-                "message_type": MSG_TYPE_BOT,
-                "message_state": MSG_STATE_FINISH,
-                "item_list": [{ "type": MSG_ITEM_TEXT, "text_item": { "text": text } }],
-                "context_token": context_token,
-            },
-            "base_info": { "channel_version": CHANNEL_VERSION }
-        })
-        .to_string(),
+        payload.to_string(),
         Some(token),
         15_000,
     )
-    .await?;
-    Ok(client_id)
+    .await
 }
 
 #[derive(Clone)]
@@ -467,6 +571,15 @@ pub async fn handle_mcp_messages(state: SharedState) -> Result<()> {
             match method {
                 "initialize" => {
                     let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    let instructions = [
+                        "Messages from WeChat users arrive as <channel source=\"wechat\" sender=\"...\" sender_id=\"...\">",
+                        "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
+                        "Messages are from real WeChat users via the WeChat ClawBot interface.",
+                        "Respond naturally in Chinese unless the user writes in another language.",
+                        "Keep replies concise — WeChat is a chat app, not an essay platform.",
+                        "Strip markdown formatting (WeChat doesn't render it). Use plain text.",
+                    ]
+                    .join("\n");
                     state.send_json(&json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -480,14 +593,7 @@ pub async fn handle_mcp_messages(state: SharedState) -> Result<()> {
                                 "name": CHANNEL_NAME,
                                 "version": CHANNEL_VERSION
                             },
-                            "instructions": [
-                                "Messages from WeChat users arrive as <channel source=\"wechat\" sender=\"...\" sender_id=\"...\">",
-                                "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
-                                "Messages are from real WeChat users via the WeChat ClawBot interface.",
-                                "Respond naturally in Chinese unless the user writes in another language.",
-                                "Keep replies concise — WeChat is a chat app, not an essay platform.",
-                                "Strip markdown formatting (WeChat doesn't render it). Use plain text."
-                            ].join("\n")
+                            "instructions": instructions
                         }
                     })).await?;
                 }
@@ -664,6 +770,169 @@ pub async fn start_polling(state: SharedState, account: AccountData) -> Result<(
                         text.chars().take(50).collect::<String>()
                     ));
                     state.notify_channel(&text, &sender_id).await?;
+                }
+            }
+            Err(err) => {
+                consecutive_failures += 1;
+                log_error(&format!("轮询异常: {err}"));
+                let delay = if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    consecutive_failures = 0;
+                    BACKOFF_DELAY_MS
+                } else {
+                    RETRY_DELAY_MS
+                };
+                sleep(Duration::from_millis(delay)).await;
+            }
+        }
+    }
+}
+
+pub fn describe_message_items(items: &[MessageItem]) -> String {
+    let mut kinds = Vec::new();
+    for item in items {
+        let label = match item.item_type {
+            Some(MSG_ITEM_TEXT) => "text",
+            Some(MSG_ITEM_VOICE) => "voice",
+            Some(other) => {
+                if item.extra.keys().any(|key| key.contains("file")) {
+                    "file"
+                } else if other == 6 {
+                    "file"
+                } else {
+                    "unknown"
+                }
+            }
+            None => {
+                if item.extra.keys().any(|key| key.contains("file")) {
+                    "file"
+                } else {
+                    "unknown"
+                }
+            }
+        };
+        kinds.push(label);
+    }
+    kinds.join(",")
+}
+
+pub async fn start_echo_polling(
+    client: &reqwest::Client,
+    account: &AccountData,
+    sync_file: &Path,
+) -> Result<()> {
+    let mut get_updates_buf = fs::read_to_string(sync_file).unwrap_or_default();
+    if !get_updates_buf.is_empty() {
+        log(&format!(
+            "恢复 echo 同步状态 ({} bytes)",
+            get_updates_buf.len()
+        ));
+    }
+    log("开始监听微信消息并原样回声...");
+
+    let mut consecutive_failures = 0usize;
+    loop {
+        match get_updates(client, &account.base_url, &account.token, &get_updates_buf).await {
+            Ok(response) => {
+                let is_error = response.ret.unwrap_or(0) != 0 || response.errcode.unwrap_or(0) != 0;
+                if is_error {
+                    consecutive_failures += 1;
+                    log_error(&format!(
+                        "getUpdates 失败: ret={} errcode={} errmsg={}",
+                        response.ret.unwrap_or_default(),
+                        response.errcode.unwrap_or_default(),
+                        response.errmsg.unwrap_or_default()
+                    ));
+                    let delay = if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        consecutive_failures = 0;
+                        BACKOFF_DELAY_MS
+                    } else {
+                        RETRY_DELAY_MS
+                    };
+                    sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+
+                consecutive_failures = 0;
+                if let Some(buf) = response.get_updates_buf {
+                    get_updates_buf = buf;
+                    if let Some(parent) = sync_file.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(sync_file, &get_updates_buf);
+                }
+
+                for msg in response.msgs.unwrap_or_default() {
+                    if msg.message_type != Some(MSG_TYPE_USER) {
+                        continue;
+                    }
+
+                    let sender_id = msg
+                        .from_user_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let Some(context_token) = msg.context_token.as_deref() else {
+                        log_error(&format!("跳过无 context_token 的消息: from={sender_id}"));
+                        continue;
+                    };
+                    let Some(items) = msg.item_list.as_ref() else {
+                        continue;
+                    };
+                    if items.is_empty() {
+                        continue;
+                    }
+
+                    let summary = describe_message_items(items);
+                    log(&format!("收到消息: from={sender_id} kinds={summary}"));
+                    match write_debug_json("incoming", &sender_id, &msg) {
+                        Ok(path) => log(&format!("已写入入站消息调试文件: {}", path.display())),
+                        Err(err) => log_error(&format!("写入入站消息调试文件失败: {err}")),
+                    }
+
+                    let client_id = generate_client_id();
+                    let payload = build_outbound_payload(&client_id, &sender_id, items, context_token);
+                    match write_debug_json("outgoing", &sender_id, &payload) {
+                        Ok(path) => log(&format!("已写入出站 payload 调试文件: {}", path.display())),
+                        Err(err) => log_error(&format!("写入出站 payload 调试文件失败: {err}")),
+                    }
+
+                    match post_send_message(client, &account.base_url, &account.token, &payload).await {
+                        Ok(response) => {
+                            match write_debug_text("send_response", &sender_id, &response) {
+                                Ok(path) => log(&format!("已写入发送响应调试文件: {}", path.display())),
+                                Err(err) => log_error(&format!("写入发送响应调试文件失败: {err}")),
+                            }
+                            log(&format!("已回声消息给 {sender_id}"));
+                        }
+                        Err(err) => {
+                            let _ = write_debug_text("send_error", &sender_id, &format!("{err:#}"));
+                            let text = extract_text_from_message(&msg);
+                            if text.is_empty() {
+                                log_error(&format!(
+                                    "回声失败且无法降级为文本: from={sender_id} error={err}"
+                                ));
+                                continue;
+                            }
+
+                            log_error(&format!(
+                                "原样回声失败，尝试文本降级: from={sender_id} error={err}"
+                            ));
+                            match send_text_message(
+                                client,
+                                &account.base_url,
+                                &account.token,
+                                &sender_id,
+                                &text,
+                                context_token,
+                            )
+                            .await
+                            {
+                                Ok(_) => log(&format!("已使用文本降级回声给 {sender_id}")),
+                                Err(fallback_err) => log_error(&format!(
+                                    "文本降级回声失败: from={sender_id} error={fallback_err}"
+                                )),
+                            }
+                        }
+                    }
                 }
             }
             Err(err) => {
