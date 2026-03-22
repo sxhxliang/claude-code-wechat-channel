@@ -1,4 +1,4 @@
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -20,6 +20,7 @@ use tokio::time::{sleep, timeout, Duration};
 
 pub const CHANNEL_NAME: &str = "wechat";
 pub const CHANNEL_VERSION: &str = "0.1.0";
+pub const API_CHANNEL_VERSION: &str = "cc-connect-weixin/1.0";
 pub const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 pub const DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 pub const BOT_TYPE: &str = "3";
@@ -35,6 +36,9 @@ pub const MSG_ITEM_VOICE: i64 = 3;
 pub const MSG_ITEM_FILE: i64 = 4;
 pub const MSG_ITEM_VIDEO: i64 = 5;
 pub const MSG_STATE_FINISH: i64 = 2;
+pub const UPLOAD_MEDIA_IMAGE: i64 = 1;
+pub const UPLOAD_MEDIA_VIDEO: i64 = 2;
+pub const UPLOAD_MEDIA_FILE: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountData {
@@ -189,6 +193,37 @@ pub struct GetUpdatesResp {
     pub get_updates_buf: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BaseInfo {
+    #[serde(rename = "channel_version")]
+    pub channel_version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GetUploadUrlRequest {
+    pub filekey: String,
+    pub media_type: i64,
+    pub to_user_id: String,
+    pub rawsize: usize,
+    pub rawfilemd5: String,
+    pub filesize: usize,
+    pub no_need_thumb: bool,
+    pub aeskey: String,
+    pub base_info: BaseInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetUploadUrlResponse {
+    pub upload_param: Option<String>,
+    pub thumb_upload_param: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CdnUploadResponse {
+    pub encrypted_param: String,
+    pub encrypted_query_param: String,
+}
+
 pub fn log(message: &str) {
     let _ = writeln!(io::stderr(), "[wechat-channel] {message}");
 }
@@ -223,6 +258,26 @@ pub fn debug_dump_dir() -> PathBuf {
 
 pub fn inbound_media_dir() -> PathBuf {
     credentials_dir().join("inbound_media")
+}
+
+pub fn first_inbound_media_file_with_extension(ext: &str) -> Result<PathBuf> {
+    let wanted = ext.trim_start_matches('.').to_ascii_lowercase();
+    let mut matches = fs::read_dir(inbound_media_dir())
+        .context("failed to read inbound media dir")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case(&wanted))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no .{wanted} sample file found in {}", inbound_media_dir().display()))
 }
 
 fn sanitize_filename_component(value: &str) -> String {
@@ -281,6 +336,15 @@ fn normalize_extension(ext: &str) -> String {
     }
 }
 
+fn random_hex(len: usize) -> String {
+    let byte_len = len.div_ceil(2);
+    let mut bytes = vec![0u8; byte_len];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut hex = hex::encode(bytes);
+    hex.truncate(len);
+    hex
+}
+
 fn image_extension(bytes: &[u8]) -> &'static str {
     if bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff {
         ".jpg"
@@ -301,6 +365,34 @@ fn normalize_voice_bytes(bytes: Vec<u8>) -> Vec<u8> {
     } else {
         bytes
     }
+}
+
+fn aes_ecb_padded_size(plaintext_len: usize) -> usize {
+    ((plaintext_len + 16) / 16) * 16
+}
+
+fn pkcs7_pad(bytes: &[u8], block_size: usize) -> Result<Vec<u8>> {
+    if block_size == 0 || block_size > 255 {
+        return Err(anyhow!("invalid block size: {block_size}"));
+    }
+    let pad = block_size - (bytes.len() % block_size);
+    let mut out = Vec::with_capacity(bytes.len() + pad);
+    out.extend_from_slice(bytes);
+    out.extend(std::iter::repeat_n(pad as u8, pad));
+    Ok(out)
+}
+
+fn encrypt_aes_ecb_pkcs7(plaintext: &[u8], key: &[u8], label: &str) -> Result<Vec<u8>> {
+    if key.len() != 16 {
+        return Err(anyhow!("{label}: aes key must be 16 bytes, got {}", key.len()));
+    }
+    let cipher = Aes128::new_from_slice(key).map_err(|_| anyhow!("{label}: invalid aes key"))?;
+    let mut out = pkcs7_pad(plaintext, 16)?;
+    for chunk in out.chunks_exact_mut(16) {
+        let block = GenericArray::from_mut_slice(chunk);
+        cipher.encrypt_block(block);
+    }
+    Ok(out)
 }
 
 fn voice_sample_rate(voice: &VoiceItem) -> i32 {
@@ -471,6 +563,26 @@ async fn fetch_cdn_bytes(
         return Err(anyhow!("{label}: cdn body exceeds 100 MiB"));
     }
     Ok(bytes.to_vec())
+}
+
+async fn fetch_cdn_response_debug(
+    client: &reqwest::Client,
+    cdn_base: &str,
+    encrypted_query_param: &str,
+) -> Result<(u16, String, Vec<u8>)> {
+    let url = build_cdn_download_url(cdn_base, encrypted_query_param);
+    let response = timeout(Duration::from_secs(120), client.get(url).send())
+        .await
+        .context("cdn debug request timed out")??;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| format!("{}: {}", name.as_str(), value.to_str().unwrap_or("<binary>")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = response.bytes().await?.to_vec();
+    Ok((status, headers, body))
 }
 
 async fn download_and_decrypt_cdn(
@@ -893,7 +1005,7 @@ pub async fn get_updates(
         "ilink/bot/getupdates",
         json!({
             "get_updates_buf": get_updates_buf,
-            "base_info": { "channel_version": CHANNEL_VERSION }
+            "base_info": { "channel_version": API_CHANNEL_VERSION }
         })
         .to_string(),
         Some(token),
@@ -901,6 +1013,306 @@ pub async fn get_updates(
     )
     .await?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+pub async fn get_upload_url(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    request: &GetUploadUrlRequest,
+) -> Result<GetUploadUrlResponse> {
+    let raw = api_fetch(
+        client,
+        base_url,
+        "ilink/bot/getuploadurl",
+        serde_json::to_string(request)?,
+        Some(token),
+        15_000,
+    )
+    .await?;
+    let response: GetUploadUrlResponse = serde_json::from_str(&raw)?;
+    if response
+        .upload_param
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(anyhow!("getuploadurl returned empty upload_param"));
+    }
+    Ok(response)
+}
+
+fn build_cdn_upload_url(cdn_base: &str, upload_param: &str, filekey: &str) -> String {
+    format!(
+        "{}/upload?encrypted_query_param={}&filekey={}",
+        cdn_base.trim_end_matches('/'),
+        urlencoding::encode(upload_param),
+        urlencoding::encode(filekey)
+    )
+}
+
+pub async fn upload_buffer_to_cdn(
+    client: &reqwest::Client,
+    cdn_base: &str,
+    upload_param: &str,
+    filekey: &str,
+    plaintext: &[u8],
+    aes_key: &[u8],
+    label: &str,
+    debug_id: &str,
+) -> Result<CdnUploadResponse> {
+    let ciphertext = encrypt_aes_ecb_pkcs7(plaintext, aes_key, label)?;
+    let url = build_cdn_upload_url(cdn_base, upload_param, filekey);
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for _ in 0..3 {
+        let response = client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(ciphertext.clone())
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let encrypted_query_param = response
+                    .headers()
+                    .get("x-encrypted-query-param")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let encrypted_param = response
+                    .headers()
+                    .get("x-encrypted-param")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let error_message = response
+                    .headers()
+                    .get("x-error-message")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| status.to_string());
+                let headers_dump = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| format!("{}: {}", name.as_str(), value.to_str().unwrap_or("<binary>")))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let _ = response.bytes().await;
+                let _ = write_debug_text(
+                    "send_file_cdn_upload_response",
+                    debug_id,
+                    &format!(
+                        "status={status}\nheaders:\n{headers_dump}\n\nencrypted_query_param:\n{}\n\nencrypted_param:\n{}",
+                        encrypted_query_param.clone().unwrap_or_default(),
+                        encrypted_param.clone().unwrap_or_default()
+                    ),
+                );
+
+                if status.is_success() {
+                    let message_param = encrypted_param
+                        .clone()
+                        .filter(|value| !value.trim().is_empty());
+                    let query_param = encrypted_query_param
+                        .clone()
+                        .filter(|value| !value.trim().is_empty());
+                    if let (Some(message_param), Some(query_param)) = (message_param, query_param) {
+                        return Ok(CdnUploadResponse {
+                            encrypted_param: message_param,
+                            encrypted_query_param: query_param,
+                        });
+                    }
+                    last_error = Some(anyhow!(
+                        "{label}: cdn upload missing x-encrypted-param or x-encrypted-query-param"
+                    ));
+                    continue;
+                }
+
+                if status.is_client_error() {
+                    return Err(anyhow!(
+                        "{label}: cdn upload client error {}: {}",
+                        status,
+                        error_message
+                    ));
+                }
+
+                last_error = Some(anyhow!(
+                    "{label}: cdn upload server error {}: {}",
+                    status,
+                    error_message
+                ));
+            }
+            Err(err) => {
+                last_error = Some(err.into());
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("{label}: cdn upload failed")))
+}
+
+pub async fn send_file_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    to: &str,
+    file_name: &str,
+    data: &[u8],
+    context_token: &str,
+) -> Result<String> {
+    if data.is_empty() {
+        return Err(anyhow!("file payload is empty"));
+    }
+
+    let mut aes_key = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut aes_key);
+    let filekey = random_hex(32);
+    let raw_md5 = format!("{:x}", md5::compute(data));
+    let upload_request = GetUploadUrlRequest {
+        filekey: filekey.clone(),
+        media_type: UPLOAD_MEDIA_FILE,
+        to_user_id: to.to_string(),
+        rawsize: data.len(),
+        rawfilemd5: raw_md5,
+        filesize: aes_ecb_padded_size(data.len()),
+        no_need_thumb: true,
+        aeskey: hex::encode(aes_key),
+        base_info: BaseInfo {
+            channel_version: API_CHANNEL_VERSION.to_string(),
+        },
+    };
+    let _ = write_debug_json("send_file_getuploadurl_request", to, &upload_request);
+    let upload_response = get_upload_url(client, base_url, token, &upload_request).await?;
+    let _ = write_debug_json("send_file_getuploadurl_response", to, &upload_response);
+    let upload_result = upload_buffer_to_cdn(
+        client,
+        DEFAULT_CDN_BASE_URL,
+        upload_response
+            .upload_param
+            .as_deref()
+            .unwrap_or_default(),
+        &filekey,
+        data,
+        &aes_key,
+        "send file",
+        to,
+    )
+    .await?;
+    let _ = write_debug_text(
+        "send_file_cdn_download_param",
+        to,
+        &format!(
+            "message_param={}\nquery_param={}",
+            upload_result.encrypted_param, upload_result.encrypted_query_param
+        ),
+    );
+    match download_and_decrypt_cdn(
+        client,
+        DEFAULT_CDN_BASE_URL,
+        &upload_result.encrypted_query_param,
+        &base64::engine::general_purpose::STANDARD.encode(aes_key),
+        "verify uploaded file",
+    )
+    .await
+    {
+        Ok(roundtrip) => {
+            let _ = write_debug_text(
+                "send_file_cdn_verify_result",
+                to,
+                &format!(
+                    "verify_ok=true\noriginal_size={}\nroundtrip_size={}\ncontent_matches={}",
+                    data.len(),
+                    roundtrip.len(),
+                    roundtrip == data
+                ),
+            );
+            if roundtrip != data {
+                return Err(anyhow!("uploaded file roundtrip content mismatch"));
+            }
+        }
+        Err(err) => {
+            if let Ok((status, headers, body)) =
+                fetch_cdn_response_debug(
+                    client,
+                    DEFAULT_CDN_BASE_URL,
+                    &upload_result.encrypted_query_param,
+                )
+                .await
+            {
+                let _ = write_debug_text(
+                    "send_file_cdn_verify_http",
+                    to,
+                    &format!(
+                        "status={status}\nheaders:\n{headers}\n\nbody_preview:\n{}",
+                        String::from_utf8_lossy(&body[..body.len().min(512)])
+                    ),
+                );
+            }
+            return Err(anyhow!("uploaded file verify failed: {err}"));
+        }
+    }
+
+    let item = MessageItem {
+        item_type: Some(MSG_ITEM_FILE),
+        text_item: None,
+        voice_item: None,
+        image_item: None,
+            file_item: Some(FileItem {
+                media: Some(CdnMedia {
+                    encrypt_query_param: Some(upload_result.encrypted_param),
+                    aes_key: Some(base64::engine::general_purpose::STANDARD.encode(aes_key)),
+                    encrypt_type: Some(1),
+                    extra: Map::new(),
+            }),
+            file_name: Some(file_name.to_string()),
+            len: Some(data.len().to_string()),
+            extra: Map::new(),
+        }),
+        video_item: None,
+        ref_msg: None,
+        extra: Map::new(),
+    };
+    let client_id = format!("cc-{}", random_hex(16));
+    let payload = build_outbound_payload(&client_id, to, &[item], context_token);
+    let _ = write_debug_json("send_file_payload", to, &payload);
+    let response = post_send_message(client, base_url, token, &payload).await?;
+    let _ = write_debug_text("send_file_send_response", to, &response);
+    Ok(client_id)
+}
+
+pub async fn handle_demo_reply(
+    client: &reqwest::Client,
+    account: &AccountData,
+    sender_id: &str,
+    msg: &WeixinMessage,
+) -> Result<bool> {
+    let Some(context_token) = msg.context_token.as_deref() else {
+        return Ok(false);
+    };
+    let text = extract_text_from_message(msg);
+    let normalized = text.trim();
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+
+    if normalized == "文档" {
+        let pdf_path = first_inbound_media_file_with_extension("pdf")?;
+        let pdf = fs::read(&pdf_path)
+            .with_context(|| format!("failed to read sample pdf {}", pdf_path.display()))?;
+        send_file_message(
+            client,
+            &account.base_url,
+            &account.token,
+            sender_id,
+            "reply.pdf",
+            &pdf,
+            context_token,
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 pub async fn send_text_message(
@@ -964,7 +1376,7 @@ pub fn build_outbound_payload(
             "item_list": items,
             "context_token": context_token,
         },
-        "base_info": { "channel_version": CHANNEL_VERSION }
+        "base_info": { "channel_version": API_CHANNEL_VERSION }
     })
 }
 
@@ -1416,6 +1828,18 @@ pub async fn start_echo_polling(
                     match write_debug_json("incoming", &sender_id, &msg) {
                         Ok(path) => log(&format!("已写入入站消息调试文件: {}", path.display())),
                         Err(err) => log_error(&format!("写入入站消息调试文件失败: {err}")),
+                    }
+
+                    match handle_demo_reply(client, account, &sender_id, &msg).await {
+                        Ok(true) => {
+                            log(&format!("已执行示例回复逻辑: from={sender_id}"));
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            log_error(&format!("示例回复逻辑失败: from={} error={err}", sender_id));
+                            continue;
+                        }
                     }
 
                     let client_id = generate_client_id();

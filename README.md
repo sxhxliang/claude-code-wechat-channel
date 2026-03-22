@@ -56,6 +56,18 @@ cargo run --bin wechat-channel
 cargo run --bin wechat-echo
 ```
 
+在 `wechat-echo` 中，如果收到文本 `文档`，会主动生成一个 `reply.pdf` 并作为文件发回微信。
+
+收到图片、文件、视频、语音等非文本内容时，程序会尝试从微信 CDN 下载并保存到本地：
+
+```text
+~/.claude/channels/wechat/inbound_media/
+```
+
+语音会同时保留原始 `.silk`，并额外生成一个可直接打开的 `.wav` 文件。
+
+同时会继续把文本内容按原有逻辑转发给 Claude Code，或在 `wechat-echo` 模式下做回声。
+
 ### 4. 在微信中发消息
 
 打开微信，找到 ClawBot 对话，发送消息。消息会出现在 Claude Code 终端中，Claude 的回复会自动发回微信。
