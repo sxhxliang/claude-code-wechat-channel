@@ -1,0 +1,24 @@
+[package]
+name = "claude-code-wechat-channel"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Code Channel plugin for WeChat via the official ilink API"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+hex = "0.4"
+qr2term = "0.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+urlencoding = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

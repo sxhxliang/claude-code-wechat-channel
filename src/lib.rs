@@ -1,0 +1,690 @@
+use anyhow::{anyhow, Context, Result};
+use base64::Engine;
+use chrono::Utc;
+use rand::RngCore;
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
+use tokio::sync::Mutex;
+use tokio::time::{sleep, timeout, Duration};
+
+pub const CHANNEL_NAME: &str = "wechat";
+pub const CHANNEL_VERSION: &str = "0.1.0";
+pub const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+pub const BOT_TYPE: &str = "3";
+pub const LONG_POLL_TIMEOUT_MS: u64 = 35_000;
+pub const MAX_CONSECUTIVE_FAILURES: usize = 3;
+pub const BACKOFF_DELAY_MS: u64 = 30_000;
+pub const RETRY_DELAY_MS: u64 = 2_000;
+pub const MSG_TYPE_USER: i64 = 1;
+pub const MSG_TYPE_BOT: i64 = 2;
+pub const MSG_ITEM_TEXT: i64 = 1;
+pub const MSG_ITEM_VOICE: i64 = 3;
+pub const MSG_STATE_FINISH: i64 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountData {
+    pub token: String,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+    #[serde(rename = "userId")]
+    pub user_id: Option<String>,
+    #[serde(rename = "savedAt")]
+    pub saved_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QrCodeResponse {
+    pub qrcode: String,
+    pub qrcode_img_content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QrStatusResponse {
+    pub status: String,
+    pub bot_token: Option<String>,
+    pub ilink_bot_id: Option<String>,
+    pub baseurl: Option<String>,
+    pub ilink_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TextItem {
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceItem {
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefMessage {
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageItem {
+    #[serde(rename = "type")]
+    pub item_type: Option<i64>,
+    pub text_item: Option<TextItem>,
+    pub voice_item: Option<VoiceItem>,
+    pub ref_msg: Option<RefMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeixinMessage {
+    pub from_user_id: Option<String>,
+    pub message_type: Option<i64>,
+    pub item_list: Option<Vec<MessageItem>>,
+    pub context_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetUpdatesResp {
+    pub ret: Option<i64>,
+    pub errcode: Option<i64>,
+    pub errmsg: Option<String>,
+    pub msgs: Option<Vec<WeixinMessage>>,
+    pub get_updates_buf: Option<String>,
+}
+
+pub fn log(message: &str) {
+    let _ = writeln!(io::stderr(), "[wechat-channel] {message}");
+}
+
+pub fn log_error(message: &str) {
+    let _ = writeln!(io::stderr(), "[wechat-channel] ERROR: {message}");
+}
+
+pub fn credentials_dir() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    Path::new(&home)
+        .join(".claude")
+        .join("channels")
+        .join("wechat")
+}
+
+pub fn credentials_file() -> PathBuf {
+    credentials_dir().join("account.json")
+}
+
+pub fn sync_buf_file() -> PathBuf {
+    credentials_dir().join("sync_buf.txt")
+}
+
+pub fn load_credentials() -> Option<AccountData> {
+    let path = credentials_file();
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+pub fn save_credentials(data: &AccountData) -> Result<()> {
+    let dir = credentials_dir();
+    fs::create_dir_all(&dir).context("failed to create credentials dir")?;
+    let path = credentials_file();
+    fs::write(&path, serde_json::to_vec_pretty(data)?).context("failed to write credentials")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(())
+}
+
+pub fn random_wechat_uin() -> String {
+    let mut bytes = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let value = u32::from_be_bytes(bytes);
+    base64::engine::general_purpose::STANDARD.encode(value.to_string())
+}
+
+pub fn generate_client_id() -> String {
+    let mut bytes = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!(
+        "claude-code-wechat:{}-{}",
+        Utc::now().timestamp_millis(),
+        hex::encode(bytes)
+    )
+}
+
+pub fn build_headers(token: Option<&str>, body: &str) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "AuthorizationType",
+        HeaderValue::from_static("ilink_bot_token"),
+    );
+    headers.insert("X-WECHAT-UIN", HeaderValue::from_str(&random_wechat_uin())?);
+    headers.insert(
+        "Content-Length",
+        HeaderValue::from_str(&body.len().to_string())?,
+    );
+    if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", token.trim()))?,
+        );
+    }
+    Ok(headers)
+}
+
+pub async fn api_fetch(
+    client: &reqwest::Client,
+    base_url: &str,
+    endpoint: &str,
+    body: String,
+    token: Option<&str>,
+    timeout_ms: u64,
+) -> Result<String> {
+    let base = if base_url.ends_with('/') {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/")
+    };
+    let url = format!("{base}{endpoint}");
+    let headers = build_headers(token, &body)?;
+    let request = client.post(url).headers(headers).body(body);
+    let response = timeout(Duration::from_millis(timeout_ms), request.send())
+        .await
+        .context("request timed out")??;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        return Err(anyhow!("HTTP {}: {}", status, text));
+    }
+    Ok(text)
+}
+
+pub async fn fetch_qrcode(client: &reqwest::Client, base_url: &str) -> Result<QrCodeResponse> {
+    let base = if base_url.ends_with('/') {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/")
+    };
+    let url = format!("{base}ilink/bot/get_bot_qrcode?bot_type={BOT_TYPE}");
+    let response = client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("QR fetch failed: {}", status));
+    }
+    Ok(response.json::<QrCodeResponse>().await?)
+}
+
+pub async fn poll_qr_status(
+    client: &reqwest::Client,
+    base_url: &str,
+    qrcode: &str,
+) -> Result<QrStatusResponse> {
+    let base = if base_url.ends_with('/') {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/")
+    };
+    let url = format!(
+        "{base}ilink/bot/get_qrcode_status?qrcode={}",
+        urlencoding::encode(qrcode)
+    );
+    let request = client.get(url).header("iLink-App-ClientVersion", "1");
+    match timeout(Duration::from_millis(35_000), request.send()).await {
+        Ok(Ok(response)) => {
+            let status = response.status();
+            if !status.is_success() {
+                return Err(anyhow!("QR status failed: {}", status));
+            }
+            Ok(response.json::<QrStatusResponse>().await?)
+        }
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Ok(QrStatusResponse {
+            status: "wait".to_string(),
+            bot_token: None,
+            ilink_bot_id: None,
+            baseurl: None,
+            ilink_user_id: None,
+        }),
+    }
+}
+
+pub async fn do_qr_login(client: &reqwest::Client, base_url: &str) -> Result<Option<AccountData>> {
+    log("正在获取微信登录二维码...");
+    let qr_resp = fetch_qrcode(client, base_url).await?;
+    log("\n请使用微信扫描以下二维码：\n");
+    if qr2term::print_qr(qr_resp.qrcode_img_content.as_bytes()).is_err() {
+        log(&format!("二维码链接: {}", qr_resp.qrcode_img_content));
+    }
+    log("等待扫码...");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(480);
+    let mut scanned_printed = false;
+
+    while tokio::time::Instant::now() < deadline {
+        let status = poll_qr_status(client, base_url, &qr_resp.qrcode).await?;
+        match status.status.as_str() {
+            "wait" => {}
+            "scaned" => {
+                if !scanned_printed {
+                    log("👀 已扫码，请在微信中确认...");
+                    scanned_printed = true;
+                }
+            }
+            "expired" => {
+                log("二维码已过期，请重新启动。");
+                return Ok(None);
+            }
+            "confirmed" => {
+                let account_id = status
+                    .ilink_bot_id
+                    .ok_or_else(|| anyhow!("登录确认但未返回 bot id"))?;
+                let token = status
+                    .bot_token
+                    .ok_or_else(|| anyhow!("登录确认但未返回 token"))?;
+                let account = AccountData {
+                    token,
+                    base_url: status.baseurl.unwrap_or_else(|| base_url.to_string()),
+                    account_id,
+                    user_id: status.ilink_user_id,
+                    saved_at: Utc::now().to_rfc3339(),
+                };
+                save_credentials(&account)?;
+                log("✅ 微信连接成功！");
+                return Ok(Some(account));
+            }
+            _ => {}
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    log("登录超时");
+    Ok(None)
+}
+
+pub fn extract_text_from_message(msg: &WeixinMessage) -> String {
+    let Some(items) = &msg.item_list else {
+        return String::new();
+    };
+
+    for item in items {
+        match item.item_type {
+            Some(MSG_ITEM_TEXT) => {
+                if let Some(text) = item.text_item.as_ref().and_then(|item| item.text.clone()) {
+                    if let Some(reference) = &item.ref_msg {
+                        if let Some(title) = &reference.title {
+                            return format!("[引用: {title}]\n{text}");
+                        }
+                    }
+                    return text;
+                }
+            }
+            Some(MSG_ITEM_VOICE) => {
+                if let Some(text) = item.voice_item.as_ref().and_then(|item| item.text.clone()) {
+                    return text;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    String::new()
+}
+
+pub async fn get_updates(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    get_updates_buf: &str,
+) -> Result<GetUpdatesResp> {
+    let raw = api_fetch(
+        client,
+        base_url,
+        "ilink/bot/getupdates",
+        json!({
+            "get_updates_buf": get_updates_buf,
+            "base_info": { "channel_version": CHANNEL_VERSION }
+        })
+        .to_string(),
+        Some(token),
+        LONG_POLL_TIMEOUT_MS,
+    )
+    .await?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+pub async fn send_text_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    to: &str,
+    text: &str,
+    context_token: &str,
+) -> Result<String> {
+    let client_id = generate_client_id();
+    api_fetch(
+        client,
+        base_url,
+        "ilink/bot/sendmessage",
+        json!({
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to,
+                "client_id": client_id,
+                "message_type": MSG_TYPE_BOT,
+                "message_state": MSG_STATE_FINISH,
+                "item_list": [{ "type": MSG_ITEM_TEXT, "text_item": { "text": text } }],
+                "context_token": context_token,
+            },
+            "base_info": { "channel_version": CHANNEL_VERSION }
+        })
+        .to_string(),
+        Some(token),
+        15_000,
+    )
+    .await?;
+    Ok(client_id)
+}
+
+#[derive(Clone)]
+pub struct SharedState {
+    pub account: Arc<Mutex<Option<AccountData>>>,
+    pub context_tokens: Arc<Mutex<HashMap<String, String>>>,
+    pub stdout: Arc<Mutex<io::Stdout>>,
+    pub client: reqwest::Client,
+}
+
+impl SharedState {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self {
+            account: Arc::new(Mutex::new(None)),
+            context_tokens: Arc::new(Mutex::new(HashMap::new())),
+            stdout: Arc::new(Mutex::new(io::stdout())),
+            client,
+        }
+    }
+
+    pub async fn send_json(&self, payload: &Value) -> Result<()> {
+        let serialized = serde_json::to_vec(payload)?;
+        let mut stdout = self.stdout.lock().await;
+        write!(stdout, "Content-Length: {}\r\n\r\n", serialized.len())?;
+        stdout.write_all(&serialized)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    pub async fn notify_channel(&self, content: &str, sender_id: &str) -> Result<()> {
+        let sender = sender_id.split('@').next().unwrap_or(sender_id);
+        self.send_json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel",
+            "params": {
+                "content": content,
+                "meta": {
+                    "sender": sender,
+                    "sender_id": sender_id,
+                }
+            }
+        }))
+        .await
+    }
+}
+
+pub async fn handle_mcp_messages(state: SharedState) -> Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut reader = AsyncBufReader::new(stdin);
+
+    loop {
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line).await?;
+            if bytes == 0 {
+                return Ok(());
+            }
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("Content-Length") {
+                    content_length = Some(value.trim().parse()?);
+                }
+            }
+        }
+
+        let length = content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).await?;
+        let message: Value = serde_json::from_slice(&body)?;
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            match method {
+                "initialize" => {
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    state.send_json(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {
+                                "experimental": { "claude/channel": {} },
+                                "tools": {}
+                            },
+                            "serverInfo": {
+                                "name": CHANNEL_NAME,
+                                "version": CHANNEL_VERSION
+                            },
+                            "instructions": [
+                                "Messages from WeChat users arrive as <channel source=\"wechat\" sender=\"...\" sender_id=\"...\">",
+                                "Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.",
+                                "Messages are from real WeChat users via the WeChat ClawBot interface.",
+                                "Respond naturally in Chinese unless the user writes in another language.",
+                                "Keep replies concise — WeChat is a chat app, not an essay platform.",
+                                "Strip markdown formatting (WeChat doesn't render it). Use plain text."
+                            ].join("\n")
+                        }
+                    })).await?;
+                }
+                "notifications/initialized" => {}
+                "tools/list" => {
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    state.send_json(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [{
+                                "name": "wechat_reply",
+                                "description": "Send a text reply back to the WeChat user",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "sender_id": {
+                                            "type": "string",
+                                            "description": "The sender_id from the inbound <channel> tag (xxx@im.wechat format)"
+                                        },
+                                        "text": {
+                                            "type": "string",
+                                            "description": "The plain-text message to send (no markdown)"
+                                        }
+                                    },
+                                    "required": ["sender_id", "text"]
+                                }
+                            }]
+                        }
+                    })).await?;
+                }
+                "tools/call" => {
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    let params = message.get("params").cloned().unwrap_or(Value::Null);
+                    let name = params
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if name != "wechat_reply" {
+                        state.send_json(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32601, "message": format!("unknown tool: {name}") }
+                        })).await?;
+                        continue;
+                    }
+
+                    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+                    let sender_id = arguments
+                        .get("sender_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let text = arguments
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let account = state.account.lock().await.clone();
+                    let result_text = if let Some(account) = account {
+                        let context_token =
+                            state.context_tokens.lock().await.get(sender_id).cloned();
+                        if let Some(context_token) = context_token {
+                            match send_text_message(
+                                &state.client,
+                                &account.base_url,
+                                &account.token,
+                                sender_id,
+                                text,
+                                &context_token,
+                            )
+                            .await
+                            {
+                                Ok(_) => "sent".to_string(),
+                                Err(err) => format!("send failed: {err}"),
+                            }
+                        } else {
+                            format!("error: no context_token for {sender_id}. The user may need to send a message first.")
+                        }
+                    } else {
+                        "error: not logged in".to_string()
+                    };
+
+                    state
+                        .send_json(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": result_text }]
+                            }
+                        }))
+                        .await?;
+                }
+                _ => {
+                    if message.get("id").is_some() {
+                        state.send_json(&json!({
+                            "jsonrpc": "2.0",
+                            "id": message.get("id").cloned().unwrap_or(Value::Null),
+                            "error": { "code": -32601, "message": format!("unsupported method: {method}") }
+                        })).await?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub async fn start_polling(state: SharedState, account: AccountData) -> Result<()> {
+    let mut get_updates_buf = fs::read_to_string(sync_buf_file()).unwrap_or_default();
+    if !get_updates_buf.is_empty() {
+        log(&format!(
+            "恢复上次同步状态 ({} bytes)",
+            get_updates_buf.len()
+        ));
+    }
+    log("开始监听微信消息...");
+
+    let mut consecutive_failures = 0usize;
+    loop {
+        match get_updates(
+            &state.client,
+            &account.base_url,
+            &account.token,
+            &get_updates_buf,
+        )
+        .await
+        {
+            Ok(response) => {
+                let is_error = response.ret.unwrap_or(0) != 0 || response.errcode.unwrap_or(0) != 0;
+                if is_error {
+                    consecutive_failures += 1;
+                    log_error(&format!(
+                        "getUpdates 失败: ret={} errcode={} errmsg={}",
+                        response.ret.unwrap_or_default(),
+                        response.errcode.unwrap_or_default(),
+                        response.errmsg.unwrap_or_default()
+                    ));
+                    let delay = if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        consecutive_failures = 0;
+                        BACKOFF_DELAY_MS
+                    } else {
+                        RETRY_DELAY_MS
+                    };
+                    sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+
+                consecutive_failures = 0;
+                if let Some(buf) = response.get_updates_buf {
+                    get_updates_buf = buf;
+                    let _ = fs::write(sync_buf_file(), &get_updates_buf);
+                }
+
+                for msg in response.msgs.unwrap_or_default() {
+                    if msg.message_type != Some(MSG_TYPE_USER) {
+                        continue;
+                    }
+                    let text = extract_text_from_message(&msg);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let sender_id = msg
+                        .from_user_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if let Some(token) = msg.context_token {
+                        state
+                            .context_tokens
+                            .lock()
+                            .await
+                            .insert(sender_id.clone(), token);
+                    }
+                    log(&format!(
+                        "收到消息: from={} text={}...",
+                        sender_id,
+                        text.chars().take(50).collect::<String>()
+                    ));
+                    state.notify_channel(&text, &sender_id).await?;
+                }
+            }
+            Err(err) => {
+                consecutive_failures += 1;
+                log_error(&format!("轮询异常: {err}"));
+                let delay = if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    consecutive_failures = 0;
+                    BACKOFF_DELAY_MS
+                } else {
+                    RETRY_DELAY_MS
+                };
+                sleep(Duration::from_millis(delay)).await;
+            }
+        }
+    }
+}
+
+pub fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    BufReader::new(io::stdin()).read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
+}

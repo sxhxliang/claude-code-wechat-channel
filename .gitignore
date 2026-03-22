@@ -1,3 +1,2 @@
-node_modules/
-.claude/
-.cursor/
+/target
+/node_modules
