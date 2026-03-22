@@ -7,6 +7,7 @@ use rand::RngCore;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use silk_rs::decode_silk;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -302,6 +303,56 @@ fn normalize_voice_bytes(bytes: Vec<u8>) -> Vec<u8> {
     }
 }
 
+fn voice_sample_rate(voice: &VoiceItem) -> i32 {
+    voice
+        .extra
+        .get("sample_rate")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16_000)
+}
+
+fn pcm_to_wav_bytes(pcm: &[u8], sample_rate: i32, channels: u16, bits_per_sample: u16) -> Result<Vec<u8>> {
+    if sample_rate <= 0 {
+        return Err(anyhow!("invalid sample rate: {sample_rate}"));
+    }
+    let byte_rate = u32::try_from(sample_rate)
+        .ok()
+        .and_then(|rate| rate.checked_mul(u32::from(channels)))
+        .and_then(|value| value.checked_mul(u32::from(bits_per_sample) / 8))
+        .ok_or_else(|| anyhow!("wav byte rate overflow"))?;
+    let block_align = channels
+        .checked_mul(bits_per_sample / 8)
+        .ok_or_else(|| anyhow!("wav block align overflow"))?;
+    let data_len = u32::try_from(pcm.len()).context("pcm too large for wav")?;
+    let riff_len = 36u32
+        .checked_add(data_len)
+        .ok_or_else(|| anyhow!("wav riff size overflow"))?;
+
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate as u32).to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    Ok(wav)
+}
+
+fn decode_silk_to_wav_bytes(silk: &[u8], sample_rate: i32) -> Result<Vec<u8>> {
+    let pcm = decode_silk(silk.to_vec(), sample_rate).context("decode silk failed")?;
+    pcm_to_wav_bytes(&pcm, sample_rate, 1, 16)
+}
+
 fn save_inbound_media_file(
     msg: &WeixinMessage,
     sender_id: &str,
@@ -576,14 +627,36 @@ pub async fn extract_and_save_inbound_media(
                 let bytes =
                     download_and_decrypt_cdn(client, cdn_base, enc, aes_key, "inbound voice").await?;
                 let bytes = normalize_voice_bytes(bytes);
-                saved.push(save_inbound_media_file(
+                let silk_path = save_inbound_media_file(
                     msg,
                     sender_id,
                     index,
                     "voice",
                     "silk",
                     &bytes,
-                )?);
+                )?;
+                saved.push(silk_path.clone());
+
+                match decode_silk_to_wav_bytes(&bytes, voice_sample_rate(voice)) {
+                    Ok(wav_bytes) => {
+                        let wav_path = save_inbound_media_file(
+                            msg,
+                            sender_id,
+                            index,
+                            "voice",
+                            "wav",
+                            &wav_bytes,
+                        )?;
+                        saved.push(wav_path);
+                    }
+                    Err(err) => {
+                        log_error(&format!(
+                            "silk 转 wav 失败: sender={} file={} error={err}",
+                            sender_id,
+                            silk_path.display()
+                        ));
+                    }
+                }
             }
             _ => {}
         }
