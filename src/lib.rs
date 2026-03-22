@@ -289,6 +289,29 @@ pub fn first_inbound_media_file_with_extensions(exts: &[&str]) -> Result<PathBuf
         .ok_or_else(|| anyhow!("no matching sample file found in {}", inbound_media_dir().display()))
 }
 
+pub fn latest_inbound_media_file_with_extensions(exts: &[&str]) -> Result<PathBuf> {
+    let wanted = exts
+        .iter()
+        .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut matches = fs::read_dir(inbound_media_dir())
+        .context("failed to read inbound media dir")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| wanted.contains(&value.to_ascii_lowercase()))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+        .into_iter()
+        .last()
+        .ok_or_else(|| anyhow!("no matching sample file found in {}", inbound_media_dir().display()))
+}
+
 pub fn first_inbound_regular_file_sample() -> Result<PathBuf> {
     let mut matches = fs::read_dir(inbound_media_dir())
         .context("failed to read inbound media dir")?
@@ -311,6 +334,63 @@ pub fn first_inbound_regular_file_sample() -> Result<PathBuf> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no regular file sample found in {}", inbound_media_dir().display()))
+}
+
+pub fn latest_inbound_image_message_sample(sender_id: &str) -> Result<WeixinMessage> {
+    let sender = sanitize_filename_component(sender_id);
+    let mut matches = fs::read_dir(debug_dump_dir())
+        .context("failed to read debug dump dir")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(|name| {
+                    name.contains("_incoming_")
+                        && name.contains(&sender)
+                        && name.ends_with(".txt")
+                })
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.reverse();
+
+    for path in matches {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+        let msg: WeixinMessage = match serde_json::from_str(&contents) {
+            Ok(msg) => msg,
+            Err(_) => continue,
+        };
+        let Some(items) = msg.item_list.as_ref() else {
+            continue;
+        };
+        for item in items {
+            if item.image_item.is_some() || item.item_type == Some(MSG_ITEM_IMAGE) {
+                return Ok(msg);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "no inbound image message sample found in {} for {}",
+        debug_dump_dir().display(),
+        sender_id
+    ))
+}
+
+pub fn latest_inbound_image_item_sample(sender_id: &str) -> Result<MessageItem> {
+    let msg = latest_inbound_image_message_sample(sender_id)?;
+    let items = msg
+        .item_list
+        .ok_or_else(|| anyhow!("latest inbound image sample missing item_list"))?;
+    items
+        .into_iter()
+        .find(|item| item.image_item.is_some() || item.item_type == Some(MSG_ITEM_IMAGE))
+        .ok_or_else(|| anyhow!("latest inbound image sample missing image item"))
 }
 
 fn sanitize_filename_component(value: &str) -> String {
@@ -1063,17 +1143,7 @@ pub async fn get_upload_url(
         15_000,
     )
     .await?;
-    let response: GetUploadUrlResponse = serde_json::from_str(&raw)?;
-    if response
-        .upload_param
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        return Err(anyhow!("getuploadurl returned empty upload_param"));
-    }
-    Ok(response)
+    Ok(serde_json::from_str(&raw)?)
 }
 
 fn build_cdn_upload_url(cdn_base: &str, upload_param: &str, filekey: &str) -> String {
@@ -1093,6 +1163,7 @@ pub async fn upload_buffer_to_cdn(
     plaintext: &[u8],
     aes_key: &[u8],
     label: &str,
+    debug_label: &str,
     debug_id: &str,
 ) -> Result<CdnUploadResponse> {
     let ciphertext = encrypt_aes_ecb_pkcs7(plaintext, aes_key, label)?;
@@ -1133,7 +1204,7 @@ pub async fn upload_buffer_to_cdn(
                     .join("\n");
                 let _ = response.bytes().await;
                 let _ = write_debug_text(
-                    "send_file_cdn_upload_response",
+                    debug_label,
                     debug_id,
                     &format!(
                         "status={status}\nheaders:\n{headers_dump}\n\nencrypted_query_param:\n{}\n\nencrypted_param:\n{}",
@@ -1217,6 +1288,15 @@ pub async fn send_file_message(
     let _ = write_debug_json("send_file_getuploadurl_request", to, &upload_request);
     let upload_response = get_upload_url(client, base_url, token, &upload_request).await?;
     let _ = write_debug_json("send_file_getuploadurl_response", to, &upload_response);
+    if upload_response
+        .upload_param
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(anyhow!("getuploadurl returned empty upload_param"));
+    }
     let upload_result = upload_buffer_to_cdn(
         client,
         DEFAULT_CDN_BASE_URL,
@@ -1228,6 +1308,7 @@ pub async fn send_file_message(
         data,
         &aes_key,
         "send file",
+        "send_file_cdn_upload_response",
         to,
     )
     .await?;
@@ -1336,17 +1417,41 @@ pub async fn send_image_message(
         media_type: UPLOAD_MEDIA_IMAGE,
         to_user_id: to.to_string(),
         rawsize: data.len(),
-        rawfilemd5: raw_md5,
+        rawfilemd5: raw_md5.clone(),
         filesize: cipher_size,
-        no_need_thumb: true,
+        no_need_thumb: false,
         aeskey: hex::encode(aes_key),
         base_info: BaseInfo {
             channel_version: API_CHANNEL_VERSION.to_string(),
         },
     };
     let _ = write_debug_json("send_image_getuploadurl_request", to, &upload_request);
-    let upload_response = get_upload_url(client, base_url, token, &upload_request).await?;
+    let mut upload_response = get_upload_url(client, base_url, token, &upload_request).await?;
     let _ = write_debug_json("send_image_getuploadurl_response", to, &upload_response);
+    if upload_response
+        .upload_param
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        let fallback_request = GetUploadUrlRequest {
+            no_need_thumb: true,
+            ..upload_request.clone()
+        };
+        let _ = write_debug_json("send_image_getuploadurl_fallback_request", to, &fallback_request);
+        upload_response = get_upload_url(client, base_url, token, &fallback_request).await?;
+        let _ = write_debug_json("send_image_getuploadurl_fallback_response", to, &upload_response);
+        if upload_response
+            .upload_param
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err(anyhow!("getuploadurl returned empty upload_param"));
+        }
+    }
     let upload_result = upload_buffer_to_cdn(
         client,
         DEFAULT_CDN_BASE_URL,
@@ -1358,9 +1463,41 @@ pub async fn send_image_message(
         data,
         &aes_key,
         "send image",
+        "send_image_cdn_upload_response",
         to,
     )
     .await?;
+    let thumb_upload_result = match upload_response
+        .thumb_upload_param
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(thumb_upload_param) => {
+            let thumb_result = upload_buffer_to_cdn(
+                client,
+                DEFAULT_CDN_BASE_URL,
+                thumb_upload_param,
+                &filekey,
+                data,
+                &aes_key,
+                "send image thumb",
+                "send_image_thumb_cdn_upload_response",
+                to,
+            )
+            .await?;
+            let _ = write_debug_text(
+                "send_image_thumb_cdn_download_param",
+                to,
+                &format!(
+                    "message_param={}\nquery_param={}",
+                    thumb_result.encrypted_param, thumb_result.encrypted_query_param
+                ),
+            );
+            Some(thumb_result)
+        }
+        None => None,
+    };
     let _ = write_debug_text(
         "send_image_cdn_download_param",
         to,
@@ -1369,6 +1506,11 @@ pub async fn send_image_message(
             upload_result.encrypted_param, upload_result.encrypted_query_param
         ),
     );
+    let media_param = upload_result.encrypted_param.clone();
+    let thumb_param = thumb_upload_result
+        .as_ref()
+        .map(|thumb| thumb.encrypted_param.clone())
+        .unwrap_or_else(|| media_param.clone());
     match download_and_decrypt_cdn(
         client,
         DEFAULT_CDN_BASE_URL,
@@ -1414,21 +1556,30 @@ pub async fn send_image_message(
         }
     }
 
+    let mut image_extra = Map::new();
+    image_extra.insert("md5".to_string(), Value::String(raw_md5));
+    image_extra.insert("len".to_string(), Value::String(data.len().to_string()));
+
     let item = MessageItem {
         item_type: Some(MSG_ITEM_IMAGE),
         text_item: None,
         voice_item: None,
         image_item: Some(ImageItem {
             media: Some(CdnMedia {
-                encrypt_query_param: Some(upload_result.encrypted_param),
+                encrypt_query_param: Some(media_param.clone()),
                 aes_key: Some(base64::engine::general_purpose::STANDARD.encode(aes_key)),
                 encrypt_type: Some(1),
                 extra: Map::new(),
             }),
-            thumb_media: None,
-            aes_key_hex: None,
-            mid_size: Some(i64::try_from(cipher_size).unwrap_or(i64::MAX)),
-            extra: Map::new(),
+            thumb_media: Some(CdnMedia {
+                encrypt_query_param: Some(thumb_param),
+                aes_key: Some(base64::engine::general_purpose::STANDARD.encode(aes_key)),
+                encrypt_type: Some(1),
+                extra: Map::new(),
+            }),
+            aes_key_hex: Some(hex::encode(aes_key)),
+            mid_size: Some(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+            extra: image_extra,
         }),
         file_item: None,
         video_item: None,
@@ -1440,6 +1591,134 @@ pub async fn send_image_message(
     let _ = write_debug_json("send_image_payload", to, &payload);
     let response = post_send_message(client, base_url, token, &payload).await?;
     let _ = write_debug_text("send_image_send_response", to, &response);
+    Ok(client_id)
+}
+
+pub async fn send_uploaded_image_from_template(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    to: &str,
+    data: &[u8],
+    context_token: &str,
+    template_item: &MessageItem,
+) -> Result<String> {
+    if data.is_empty() {
+        return Err(anyhow!("image payload is empty"));
+    }
+
+    let mut aes_key = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut aes_key);
+    let filekey = random_hex(32);
+    let raw_md5 = format!("{:x}", md5::compute(data));
+    let cipher_size = aes_ecb_padded_size(data.len());
+    let upload_request = GetUploadUrlRequest {
+        filekey: filekey.clone(),
+        media_type: UPLOAD_MEDIA_IMAGE,
+        to_user_id: to.to_string(),
+        rawsize: data.len(),
+        rawfilemd5: raw_md5.clone(),
+        filesize: cipher_size,
+        no_need_thumb: true,
+        aeskey: hex::encode(aes_key),
+        base_info: BaseInfo {
+            channel_version: API_CHANNEL_VERSION.to_string(),
+        },
+    };
+    let _ = write_debug_json("send_image_upload_from_template_getuploadurl_request", to, &upload_request);
+    let upload_response = get_upload_url(client, base_url, token, &upload_request).await?;
+    let _ = write_debug_json("send_image_upload_from_template_getuploadurl_response", to, &upload_response);
+    if upload_response
+        .upload_param
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(anyhow!("getuploadurl returned empty upload_param"));
+    }
+    let upload_result = upload_buffer_to_cdn(
+        client,
+        DEFAULT_CDN_BASE_URL,
+        upload_response
+            .upload_param
+            .as_deref()
+            .unwrap_or_default(),
+        &filekey,
+        data,
+        &aes_key,
+        "send image from template",
+        "send_image_upload_from_template_cdn_upload_response",
+        to,
+    )
+    .await?;
+    let _ = write_debug_text(
+        "send_image_upload_from_template_cdn_download_param",
+        to,
+        &format!(
+            "message_param={}\nquery_param={}",
+            upload_result.encrypted_param, upload_result.encrypted_query_param
+        ),
+    );
+    match download_and_decrypt_cdn(
+        client,
+        DEFAULT_CDN_BASE_URL,
+        &upload_result.encrypted_query_param,
+        &base64::engine::general_purpose::STANDARD.encode(aes_key),
+        "verify uploaded image from template",
+    )
+    .await
+    {
+        Ok(roundtrip) => {
+            let _ = write_debug_text(
+                "send_image_upload_from_template_cdn_verify_result",
+                to,
+                &format!(
+                    "verify_ok=true\noriginal_size={}\nroundtrip_size={}\ncontent_matches={}",
+                    data.len(),
+                    roundtrip.len(),
+                    roundtrip == data
+                ),
+            );
+            if roundtrip != data {
+                return Err(anyhow!("uploaded image roundtrip content mismatch"));
+            }
+        }
+        Err(err) => {
+            return Err(anyhow!("uploaded image verify failed: {err}"));
+        }
+    }
+
+    let mut item = template_item.clone();
+    item.item_type = Some(MSG_ITEM_IMAGE);
+    item.text_item = None;
+    item.voice_item = None;
+    item.file_item = None;
+    item.video_item = None;
+    item.ref_msg = None;
+    if let Some(image_item) = item.image_item.as_mut() {
+        image_item.media = Some(CdnMedia {
+            encrypt_query_param: Some(upload_result.encrypted_param),
+            aes_key: Some(base64::engine::general_purpose::STANDARD.encode(aes_key)),
+            encrypt_type: Some(1),
+            extra: Map::new(),
+        });
+        image_item.thumb_media = None;
+        image_item.aes_key_hex = Some(hex::encode(aes_key));
+        image_item.mid_size = Some(i64::try_from(data.len()).unwrap_or(i64::MAX));
+        image_item
+            .extra
+            .insert("hd_size".to_string(), Value::from(i64::try_from(data.len()).unwrap_or(i64::MAX)));
+        image_item.extra.remove("url");
+    } else {
+        return Err(anyhow!("template item does not contain image_item"));
+    }
+
+    let client_id = generate_client_id();
+    let payload = build_outbound_payload(&client_id, to, &[item], context_token);
+    let _ = write_debug_json("send_image_upload_from_template_payload", to, &payload);
+    let response = post_send_message(client, base_url, token, &payload).await?;
+    let _ = write_debug_text("send_image_upload_from_template_response", to, &response);
     Ok(client_id)
 }
 
@@ -1456,6 +1735,40 @@ pub async fn handle_demo_reply(
     let normalized = text.trim();
     if normalized.is_empty() {
         return Ok(false);
+    }
+
+    if normalized == "图片预览" || normalized == "内联图片" {
+        let image_path = latest_inbound_media_file_with_extensions(&["jpg", "jpeg", "png", "gif", "webp"])?;
+        let image = fs::read(&image_path)
+            .with_context(|| format!("failed to read latest inbound image {}", image_path.display()))?;
+        let template_msg = latest_inbound_image_message_sample(sender_id)
+            .context("failed to load latest inbound image message sample")?;
+        let template_context_token = template_msg
+            .context_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(context_token);
+        let template_item = template_msg
+            .item_list
+            .as_ref()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.image_item.is_some() || item.item_type == Some(MSG_ITEM_IMAGE))
+            })
+            .cloned()
+            .ok_or_else(|| anyhow!("latest inbound image sample missing image item"))?;
+        send_uploaded_image_from_template(
+            client,
+            &account.base_url,
+            &account.token,
+            sender_id,
+            &image,
+            template_context_token,
+            &template_item,
+        )
+        .await?;
+        return Ok(true);
     }
 
     if normalized == "图片" || normalized == "图像" {

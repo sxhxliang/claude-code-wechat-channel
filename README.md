@@ -56,7 +56,12 @@ cargo run --bin wechat-channel
 cargo run --bin wechat-echo
 ```
 
-在 `wechat-echo` 中，如果收到文本 `文档`，会主动生成一个 `reply.pdf` 并作为文件发回微信。
+在 `wechat-echo` 中，会从 `~/.claude/channels/wechat/inbound_media/` 读取你已有的样本文件并主动发回微信：
+
+- `图片` / `图像`：发送第一张样本图片文件（按文件附件回传，兼容当前微信桥接）
+- `图片预览` / `内联图片`：上传最近一张真实入站图片文件，并复用最近图片消息的 `image_item` 元数据做预览测试
+- `文档`：发送第一份 PDF
+- `文件`：发送第一份普通文件样本
 
 收到图片、文件、视频、语音等非文本内容时，程序会尝试从微信 CDN 下载并保存到本地：
 
