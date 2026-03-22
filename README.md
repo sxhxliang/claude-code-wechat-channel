@@ -1,12 +1,12 @@
 # Claude Code WeChat Channel
 
-将微信消息桥接到 Claude Code 会话的 Channel 插件。
+将微信消息桥接到 Claude Code 会话的 Rust 版 Channel 插件。
 
 基于微信官方 ClawBot ilink API（与 `@tencent-weixin/openclaw-weixin` 使用相同协议），让你在微信中直接与 Claude Code 对话。
 
 ## 工作原理
 
-```
+```text
 微信 (iOS) → WeChat ClawBot → ilink API → [本插件] → Claude Code Session
                                                   ↕
 Claude Code ← MCP Channel Protocol ← wechat_reply tool
@@ -14,25 +14,26 @@ Claude Code ← MCP Channel Protocol ← wechat_reply tool
 
 ## 前置要求
 
-- [Bun](https://bun.sh) >= 1.0
+- [Rust](https://www.rust-lang.org/tools/install) stable
+- [Cargo](https://doc.rust-lang.org/cargo/)（随 Rust 一起安装）
 - [Claude Code](https://claude.com/claude-code) >= 2.1.80
 - claude.ai 账号登录（不支持 API key）
 - 微信 iOS 最新版（需支持 ClawBot 插件）
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 获取代码并编译
 
 ```bash
 git clone https://github.com/anthropics/claude-code-wechat-channel.git
 cd claude-code-wechat-channel
-bun install
+cargo build
 ```
 
 ### 2. 微信扫码登录
 
 ```bash
-bun setup.ts
+cargo run --bin setup
 ```
 
 终端会显示二维码，用微信扫描并确认。凭据保存到 `~/.claude/channels/wechat/account.json`。
@@ -40,9 +41,10 @@ bun setup.ts
 ### 3. 启动 Claude Code + WeChat 通道
 
 ```bash
-cd claude-code-wechat-channel
 claude --dangerously-load-development-channels server:wechat
 ```
+
+`.mcp.json` 默认会通过 Cargo 启动 Rust 版 channel server。
 
 ### 4. 在微信中发消息
 
@@ -52,8 +54,9 @@ claude --dangerously-load-development-channels server:wechat
 
 | 文件 | 说明 |
 |------|------|
-| `wechat-channel.ts` | MCP Channel 服务器主文件 |
-| `setup.ts` | 独立的微信扫码登录工具 |
+| `src/bin/wechat-channel.rs` | MCP Channel 服务器主文件 |
+| `src/bin/setup.rs` | 独立的微信扫码登录工具 |
+| `src/lib.rs` | WeChat ilink API、认证、JSON-RPC 与共享逻辑 |
 | `.mcp.json` | Claude Code MCP 服务器配置 |
 
 ## 技术细节
@@ -61,7 +64,7 @@ claude --dangerously-load-development-channels server:wechat
 - **消息接收**: 通过 `ilink/bot/getupdates` 长轮询获取微信消息
 - **消息发送**: 通过 `ilink/bot/sendmessage` 发送回复
 - **认证**: 使用 `ilink/bot/get_bot_qrcode` QR 码登录获取 Bearer Token
-- **协议**: 基于 MCP (Model Context Protocol) 的 Channel 扩展
+- **协议**: 基于 MCP (Model Context Protocol) 的 Channel 扩展，使用 stdio JSON-RPC 与 Claude Code 通信
 
 ## 注意事项
 

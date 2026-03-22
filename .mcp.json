@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "wechat": {
-      "command": "bun",
-      "args": ["./wechat-channel.ts"]
+      "command": "cargo",
+      "args": ["run", "--quiet", "--bin", "wechat-channel"]
     }
   }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "claude-code-wechat-channel"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Code Channel plugin for WeChat via the official ilink API"
+license = "MIT"
+
+[[bin]]
+name = "wechat-channel"
+path = "src/bin/wechat-channel.rs"
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"
+
+[dependencies]
