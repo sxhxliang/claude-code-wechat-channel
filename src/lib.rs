@@ -121,6 +121,8 @@ pub struct FileItem {
     pub file_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub len: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -261,7 +263,14 @@ pub fn inbound_media_dir() -> PathBuf {
 }
 
 pub fn first_inbound_media_file_with_extension(ext: &str) -> Result<PathBuf> {
-    let wanted = ext.trim_start_matches('.').to_ascii_lowercase();
+    first_inbound_media_file_with_extensions(&[ext])
+}
+
+pub fn first_inbound_media_file_with_extensions(exts: &[&str]) -> Result<PathBuf> {
+    let wanted = exts
+        .iter()
+        .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let mut matches = fs::read_dir(inbound_media_dir())
         .context("failed to read inbound media dir")?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -269,7 +278,7 @@ pub fn first_inbound_media_file_with_extension(ext: &str) -> Result<PathBuf> {
         .filter(|path| {
             path.extension()
                 .and_then(|value| value.to_str())
-                .map(|value| value.eq_ignore_ascii_case(&wanted))
+                .map(|value| wanted.contains(&value.to_ascii_lowercase()))
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
@@ -277,7 +286,31 @@ pub fn first_inbound_media_file_with_extension(ext: &str) -> Result<PathBuf> {
     matches
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("no .{wanted} sample file found in {}", inbound_media_dir().display()))
+        .ok_or_else(|| anyhow!("no matching sample file found in {}", inbound_media_dir().display()))
+}
+
+pub fn first_inbound_regular_file_sample() -> Result<PathBuf> {
+    let mut matches = fs::read_dir(inbound_media_dir())
+        .context("failed to read inbound media dir")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase());
+            match ext.as_deref() {
+                Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "silk" | "wav") => false,
+                Some(_) => true,
+                None => false,
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no regular file sample found in {}", inbound_media_dir().display()))
 }
 
 fn sanitize_filename_component(value: &str) -> String {
@@ -1173,7 +1206,7 @@ pub async fn send_file_message(
         media_type: UPLOAD_MEDIA_FILE,
         to_user_id: to.to_string(),
         rawsize: data.len(),
-        rawfilemd5: raw_md5,
+        rawfilemd5: raw_md5.clone(),
         filesize: aes_ecb_padded_size(data.len()),
         no_need_thumb: true,
         aeskey: hex::encode(aes_key),
@@ -1259,13 +1292,14 @@ pub async fn send_file_message(
         image_item: None,
             file_item: Some(FileItem {
                 media: Some(CdnMedia {
-                    encrypt_query_param: Some(upload_result.encrypted_param),
+                    encrypt_query_param: Some(upload_result.encrypted_param.clone()),
                     aes_key: Some(base64::engine::general_purpose::STANDARD.encode(aes_key)),
                     encrypt_type: Some(1),
                     extra: Map::new(),
             }),
             file_name: Some(file_name.to_string()),
             len: Some(data.len().to_string()),
+            md5: Some(raw_md5),
             extra: Map::new(),
         }),
         video_item: None,
@@ -1277,6 +1311,135 @@ pub async fn send_file_message(
     let _ = write_debug_json("send_file_payload", to, &payload);
     let response = post_send_message(client, base_url, token, &payload).await?;
     let _ = write_debug_text("send_file_send_response", to, &response);
+    Ok(client_id)
+}
+
+pub async fn send_image_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    to: &str,
+    data: &[u8],
+    context_token: &str,
+) -> Result<String> {
+    if data.is_empty() {
+        return Err(anyhow!("image payload is empty"));
+    }
+
+    let mut aes_key = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut aes_key);
+    let filekey = random_hex(32);
+    let raw_md5 = format!("{:x}", md5::compute(data));
+    let cipher_size = aes_ecb_padded_size(data.len());
+    let upload_request = GetUploadUrlRequest {
+        filekey: filekey.clone(),
+        media_type: UPLOAD_MEDIA_IMAGE,
+        to_user_id: to.to_string(),
+        rawsize: data.len(),
+        rawfilemd5: raw_md5,
+        filesize: cipher_size,
+        no_need_thumb: true,
+        aeskey: hex::encode(aes_key),
+        base_info: BaseInfo {
+            channel_version: API_CHANNEL_VERSION.to_string(),
+        },
+    };
+    let _ = write_debug_json("send_image_getuploadurl_request", to, &upload_request);
+    let upload_response = get_upload_url(client, base_url, token, &upload_request).await?;
+    let _ = write_debug_json("send_image_getuploadurl_response", to, &upload_response);
+    let upload_result = upload_buffer_to_cdn(
+        client,
+        DEFAULT_CDN_BASE_URL,
+        upload_response
+            .upload_param
+            .as_deref()
+            .unwrap_or_default(),
+        &filekey,
+        data,
+        &aes_key,
+        "send image",
+        to,
+    )
+    .await?;
+    let _ = write_debug_text(
+        "send_image_cdn_download_param",
+        to,
+        &format!(
+            "message_param={}\nquery_param={}",
+            upload_result.encrypted_param, upload_result.encrypted_query_param
+        ),
+    );
+    match download_and_decrypt_cdn(
+        client,
+        DEFAULT_CDN_BASE_URL,
+        &upload_result.encrypted_query_param,
+        &base64::engine::general_purpose::STANDARD.encode(aes_key),
+        "verify uploaded image",
+    )
+    .await
+    {
+        Ok(roundtrip) => {
+            let _ = write_debug_text(
+                "send_image_cdn_verify_result",
+                to,
+                &format!(
+                    "verify_ok=true\noriginal_size={}\nroundtrip_size={}\ncontent_matches={}",
+                    data.len(),
+                    roundtrip.len(),
+                    roundtrip == data
+                ),
+            );
+            if roundtrip != data {
+                return Err(anyhow!("uploaded image roundtrip content mismatch"));
+            }
+        }
+        Err(err) => {
+            if let Ok((status, headers, body)) = fetch_cdn_response_debug(
+                client,
+                DEFAULT_CDN_BASE_URL,
+                &upload_result.encrypted_query_param,
+            )
+            .await
+            {
+                let _ = write_debug_text(
+                    "send_image_cdn_verify_http",
+                    to,
+                    &format!(
+                        "status={status}\nheaders:\n{headers}\n\nbody_preview:\n{}",
+                        String::from_utf8_lossy(&body[..body.len().min(512)])
+                    ),
+                );
+            }
+            return Err(anyhow!("uploaded image verify failed: {err}"));
+        }
+    }
+
+    let item = MessageItem {
+        item_type: Some(MSG_ITEM_IMAGE),
+        text_item: None,
+        voice_item: None,
+        image_item: Some(ImageItem {
+            media: Some(CdnMedia {
+                encrypt_query_param: Some(upload_result.encrypted_param),
+                aes_key: Some(base64::engine::general_purpose::STANDARD.encode(aes_key)),
+                encrypt_type: Some(1),
+                extra: Map::new(),
+            }),
+            thumb_media: None,
+            aes_key_hex: None,
+            mid_size: Some(i64::try_from(cipher_size).unwrap_or(i64::MAX)),
+            extra: Map::new(),
+        }),
+        file_item: None,
+        video_item: None,
+        ref_msg: None,
+        extra: Map::new(),
+    };
+    let client_id = format!("cc-{}", random_hex(16));
+    let payload = build_outbound_payload(&client_id, to, &[item], context_token);
+    let _ = write_debug_json("send_image_payload", to, &payload);
+    let response = post_send_message(client, base_url, token, &payload).await?;
+    let _ = write_debug_text("send_image_send_response", to, &response);
     Ok(client_id)
 }
 
@@ -1295,17 +1458,45 @@ pub async fn handle_demo_reply(
         return Ok(false);
     }
 
-    if normalized == "文档" {
-        let pdf_path = first_inbound_media_file_with_extension("pdf")?;
-        let pdf = fs::read(&pdf_path)
-            .with_context(|| format!("failed to read sample pdf {}", pdf_path.display()))?;
+    if normalized == "图片" || normalized == "图像" {
+        let image_path =
+            first_inbound_media_file_with_extensions(&["jpg", "jpeg", "png", "gif", "webp"])?;
+        let image = fs::read(&image_path)
+            .with_context(|| format!("failed to read sample image {}", image_path.display()))?;
         send_file_message(
             client,
             &account.base_url,
             &account.token,
             sender_id,
-            "reply.pdf",
-            &pdf,
+            image_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image.jpg"),
+            &image,
+            context_token,
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    if normalized == "文档" || normalized == "文件" {
+        let file_path = if normalized == "文档" {
+            first_inbound_media_file_with_extension("pdf")?
+        } else {
+            first_inbound_regular_file_sample()?
+        };
+        let file_bytes = fs::read(&file_path)
+            .with_context(|| format!("failed to read sample file {}", file_path.display()))?;
+        send_file_message(
+            client,
+            &account.base_url,
+            &account.token,
+            sender_id,
+            file_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("attachment.bin"),
+            &file_bytes,
             context_token,
         )
         .await?;
